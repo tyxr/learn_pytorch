@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 import seaborn
 seaborn.set_context(context="talk")
 #%matplotlib inline
-
+attention_num = 0
+multi_attention = 0
 class EncoderDecoder(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many
@@ -143,13 +144,24 @@ def subsequent_mask(size):
 
 
 def attention(query, key, value, mask=None, dropout=None):
+    #print("query.size",query.size())
+    #print("key.size",key.size())
+    #print("value.size",value.size())
+
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
     scores = torch.matmul(query, key.transpose(-2, -1)) \
              / math.sqrt(d_k)
+    #print("scores.size",scores.size())
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
+    #print("mask scores.size",scores.size())
     p_attn = F.softmax(scores, dim = -1)
+    #print("p_attn",p_attn.size())
+
+    global attention_num
+    attention_num +=1
+
     if dropout is not None:
         p_attn = dropout(p_attn)
     return torch.matmul(p_attn, value), p_attn
@@ -163,22 +175,25 @@ class MultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = d_model // h
         self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.linears = clones(nn.Linear(d_model, d_model), 3)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
+        global multi_attention
+        multi_attention+=1
+
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
-
+        #print("before",query.size())
         # 1) Do all the linear projections in batch from d_model => h x d_k
         query, key, value = \
             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)  #h=8   d_k=64
              for l, x in zip(self.linears, (query, key, value))]
-
+        #print("after query.size",query.size())
         # 2) Apply attention on all the projected vectors in batch.
         x, self.attn = attention(query, key, value, mask=mask,
                                  dropout=self.dropout)
@@ -288,6 +303,9 @@ def run_epoch(data_iter, model, loss_compute):
     for i, batch in enumerate(data_iter):
         out = model.forward(batch.src, batch.trg,
                             batch.src_mask, batch.trg_mask)
+        #print("out size",out.size())
+        #print("batch.trg_y size",batch.trg_y.size())
+        #print("batch.ntokens size",batch.ntokens.size())
         loss = loss_compute(out, batch.trg_y, batch.ntokens)
         total_loss += loss
         total_tokens += batch.ntokens
@@ -298,6 +316,7 @@ def run_epoch(data_iter, model, loss_compute):
                     (i, loss / batch.ntokens, tokens / elapsed))
             start = time.time()
             tokens = 0
+        break
     return total_loss / total_tokens
 
 global max_src_in_batch, max_tgt_in_batch
@@ -353,7 +372,7 @@ class LabelSmoothing(nn.Module):
 
     def __init__(self, size, padding_idx, smoothing=0.0):
         super(LabelSmoothing, self).__init__()
-        self.criterion = nn.KLDivLoss(size_average=False)
+        self.criterion = nn.KLDivLoss(reduction='sum')
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -374,12 +393,16 @@ class LabelSmoothing(nn.Module):
 
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     memory = model.encode(src, src_mask)
+    print("after encode attention_num",attention_num)
     ys = torch.ones(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
         out = model.decode(memory, src_mask,
                            Variable(ys),
                            Variable(subsequent_mask(ys.size(1))
                                     .type_as(src.data)))
+        print("one step",i)
+        print("attention_num", attention_num)
+
         prob = model.generator(out[:, -1])
         _, next_word = torch.max(prob, dim=1)
         next_word = next_word.data[0]
@@ -573,9 +596,9 @@ def example_two():
 
     # GPUs to use
     # devices = [0, 1, 2, 3]
-    devices = [0, 1]
+    #devices = [0, 1]
     ddd = torch.device("cuda")
-    print(torch.cuda.device_count())
+    #print(torch.cuda.device_count())
     if True:
         pad_idx = TGT.vocab.stoi["<blank>"]
         model = make_model(len(SRC.vocab), len(TGT.vocab), N=6)
@@ -589,11 +612,13 @@ def example_two():
         valid_iter = MyIterator(val, batch_size=BATCH_SIZE, device=ddd,
                                 repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
                                 batch_size_fn=batch_size_fn, train=False)
-        model_par = nn.DataParallel(model, device_ids=devices)
-        devices = [0]
-        # model_par = model
-    ddd = True
-    if ddd:
+        #model_par = nn.DataParallel(model, device_ids=devices)
+
+        model_par = model
+#--------------------------------------------------------------------------------------------------------
+    #在这里训练模型
+    bbb = False
+    if bbb:
         model_opt = NoamOpt(model.src_embed[0].d_model, 1, 2000,
                             torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
         for epoch in range(10):
@@ -617,17 +642,23 @@ def example_two():
                              SimpleLossCompute(model.generator, criterion,
                                                   opt=None))
             print(loss)
+# --------------------------------------------------------------------------------------------------------
 
     # !wget https://s3.amazonaws.com/opennmt-models/iwslt.pt
     else:
+        torch.nn.Module.dump_patches = True
         model = torch.load("/data1/home/xingk/code/transform/iwslt.pt")
 
     for i, batch in enumerate(valid_iter):
         src = batch.src.transpose(0, 1)[:1]
         src_mask = (src != SRC.vocab.stoi["<blank>"]).unsqueeze(-2)
+        print("src",src)
+        print("src_mask",src_mask)
         out = greedy_decode(model, src, src_mask,
-                            max_len=60, start_symbol=TGT.vocab.stoi["<s>"])
+                            max_len=30, start_symbol=TGT.vocab.stoi["<s>"])
         print("Translation:", end="\t")
+        print("multi_attention",multi_attention)
+        print("attention_num",attention_num)
         for i in range(1, out.size(1)):
             sym = TGT.vocab.itos[out[0, i]]
             if sym == "</s>": break
